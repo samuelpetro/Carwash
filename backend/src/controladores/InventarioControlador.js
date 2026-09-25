@@ -4,9 +4,11 @@
  */
 const InsumoRepositorio = require('../repositorios/InsumoRepositorio');
 const AuditoriaRepositorio = require('../repositorios/AuditoriaRepositorio');
+const FacturaRepositorio = require('../repositorios/FacturaRepositorio');
+const { obtenerFechaHoy } = require('../utilidades/fechas');
 
 async function listarInsumos(req, res) {
-  res.json(await InsumoRepositorio.listarInsumos());
+  res.json(await InsumoRepositorio.listarInsumos({ soloActivos: req.query.activos === 'true' }));
 }
 
 async function crearInsumo(req, res) {
@@ -29,7 +31,7 @@ async function crearInsumo(req, res) {
 
 async function actualizarInsumo(req, res) {
   const id = Number(req.params.id);
-  const { nombre, unidad_medida, stock_minimo, costo_unitario, proveedor_id } = req.body;
+  const { nombre, unidad_medida, stock_minimo, costo_unitario, proveedor_id, estado } = req.body;
 
   const cambios = {};
   if (nombre) cambios.nombre = nombre;
@@ -37,6 +39,12 @@ async function actualizarInsumo(req, res) {
   if (stock_minimo !== undefined) cambios.stock_minimo = parseFloat(stock_minimo);
   if (costo_unitario !== undefined) cambios.costo_unitario = parseFloat(costo_unitario);
   if (proveedor_id !== undefined) cambios.proveedor_id = parseInt(proveedor_id, 10) || null;
+  if (estado !== undefined) {
+    if (estado !== 'activo' && estado !== 'inactivo') {
+      return res.status(400).json({ error: 'Estado no válido.' });
+    }
+    cambios.estado = estado;
+  }
 
   const insumo = await InsumoRepositorio.actualizarInsumo(id, cambios);
   if (!insumo) return res.status(404).json({ error: 'Insumo no encontrado.' });
@@ -58,14 +66,21 @@ async function registrarEntrada(req, res) {
     return res.status(400).json({ error: 'El costo unitario de la compra no es válido.' });
   }
 
-  await InsumoRepositorio.registrarEntrada({
+  const proveedorId = proveedor_id ? parseInt(proveedor_id, 10) : insumo.proveedor_id;
+  const movimientoId = await InsumoRepositorio.registrarEntrada({
     insumoId: insumo.id, cantidad: cant,
-    proveedorId: proveedor_id ? parseInt(proveedor_id, 10) : insumo.proveedor_id,
-    usuarioId: req.usuarioAutenticado.id, observacion, costoUnitario
+    proveedorId, usuarioId: req.usuarioAutenticado.id, observacion, costoUnitario
   });
 
-  await AuditoriaRepositorio.registrar(req.usuarioAutenticado.id, 'entrada_inventario', `Entrada de ${cant} ${insumo.unidad_medida} de ${insumo.nombre}`);
-  res.status(201).json(await InsumoRepositorio.obtenerInsumoPorId(insumo.id));
+  const fecha = obtenerFechaHoy();
+  const costoTotal = cant * (costoUnitario !== null ? costoUnitario : Number(insumo.costo_unitario));
+  const factura = await FacturaRepositorio.crearFactura({
+    tipo: 'compra', movimientoId, proveedorId, concepto: insumo.nombre,
+    total: costoTotal, fecha, creadoPor: req.usuarioAutenticado.id
+  });
+
+  await AuditoriaRepositorio.registrar(req.usuarioAutenticado.id, 'entrada_inventario', `Entrada de ${cant} ${insumo.unidad_medida} de ${insumo.nombre} (Factura ${factura.numero_factura})`);
+  res.status(201).json({ ...(await InsumoRepositorio.obtenerInsumoPorId(insumo.id)), factura });
 }
 
 async function listarAlertas(req, res) {
@@ -98,7 +113,7 @@ async function registrarEntrega(req, res) {
 }
 
 async function listarProveedores(req, res) {
-  res.json(await InsumoRepositorio.listarProveedores());
+  res.json(await InsumoRepositorio.listarProveedores({ soloActivos: req.query.activos === 'true' }));
 }
 
 async function crearProveedor(req, res) {
@@ -110,8 +125,33 @@ async function crearProveedor(req, res) {
   res.status(201).json(nuevo);
 }
 
+/** Los proveedores nunca se eliminan: solo se editan o se inactivan/activan. */
+async function actualizarProveedor(req, res) {
+  const id = Number(req.params.id);
+  const { nombre, contacto, telefono, correo, direccion, estado } = req.body;
+
+  const cambios = {};
+  if (nombre) cambios.nombre = nombre;
+  if (contacto !== undefined) cambios.contacto = contacto;
+  if (telefono !== undefined) cambios.telefono = telefono;
+  if (correo !== undefined) cambios.correo = correo;
+  if (direccion !== undefined) cambios.direccion = direccion;
+  if (estado !== undefined) {
+    if (estado !== 'activo' && estado !== 'inactivo') {
+      return res.status(400).json({ error: 'Estado no válido.' });
+    }
+    cambios.estado = estado;
+  }
+
+  const proveedor = await InsumoRepositorio.actualizarProveedor(id, cambios);
+  if (!proveedor) return res.status(404).json({ error: 'Proveedor no encontrado.' });
+
+  await AuditoriaRepositorio.registrar(req.usuarioAutenticado.id, 'actualizar_proveedor', `Actualizado proveedor ID ${id}`);
+  res.json(proveedor);
+}
+
 module.exports = {
   listarInsumos, crearInsumo, actualizarInsumo, registrarEntrada,
   listarAlertas, listarMovimientos, listarEntregas, registrarEntrega,
-  listarProveedores, crearProveedor
+  listarProveedores, crearProveedor, actualizarProveedor
 };

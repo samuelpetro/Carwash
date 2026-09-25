@@ -102,7 +102,8 @@ const app = {
       case 'servicios': this.loadServicios(); break;
       case 'nomina': this.loadNomina(); break;
       case 'caja': this.loadCaja(); break;
-      case 'dashboard': this.loadDashboard(); break;
+      case 'facturas': this.loadFacturas(); break;
+      case 'dashboard': this.loadReporteActivo(); break;
     }
   },
 
@@ -261,7 +262,7 @@ const app = {
   },
 
   formatMoney(num) {
-    return '$' + (num || 0).toLocaleString('es-CO');
+    return '$' + Number(num || 0).toLocaleString('es-CO');
   },
 
   // ===========================================================================
@@ -269,7 +270,7 @@ const app = {
   // ===========================================================================
   async loadServices() {
     try {
-      this.services = await ApiCliente.get('/api/servicios');
+      this.services = await ApiCliente.get('/api/servicios?activos=true');
       this.renderPosServices();
 
       ['citaServicioSelect', 'turnoServicioSelect'].forEach(id => {
@@ -468,15 +469,18 @@ const app = {
             <strong>#${t.numero_turno || (idx + 1)} Turno - ${t.placa || 'Sin Placa'} (${t.tipo_vehiculo})</strong>
             <span>${t.servicio_nombre} • Hora: ${t.hora_llegada} • ${this.formatMoney(t.servicio_precio)}</span>
           </div>
-          <button class="btn btn-sm btn-primary" onclick="app.atenderTurno(${t.id}, ${t.servicio_id}, '${t.placa}', '${t.tipo_vehiculo}')">Iniciar</button>
+          <button class="btn btn-sm btn-primary" onclick="app.atenderTurno(${t.id}, ${t.servicio_id}, '${t.placa}', '${t.tipo_vehiculo}', ${t.cliente_id || 'null'}, ${t.vehiculo_id || 'null'})">Iniciar</button>
         </div>
       `).join('');
     } catch (err) { console.error(err); }
   },
 
-  atenderTurno(turnoId, servicioId, placa, tipo) {
+  atenderTurno(turnoId, servicioId, placa, tipo, clienteId, vehiculoId) {
+    const payload = clienteId
+      ? { turno_id: turnoId, servicio_id: servicioId, cliente_id: clienteId, vehiculo_id: vehiculoId }
+      : { turno_id: turnoId, servicio_id: servicioId, es_venta_anonima: true, placa_anonima: placa, tipo_vehiculo_anonimo: tipo };
     this.abrirModalAsignarLavador(
-      { turno_id: turnoId, servicio_id: servicioId, es_venta_anonima: true, placa_anonima: placa, tipo_vehiculo_anonimo: tipo },
+      payload,
       () => { this.loadTurnos(); this.loadOrders(); this.setTab('tablero'); }
     );
   },
@@ -586,8 +590,8 @@ const app = {
     if (!this.payingOrderId) return;
     const metodo = document.querySelector('input[name="payMetodo"]:checked').value;
     try {
-      await ApiCliente.post('/api/caja/pagos', { orden_id: this.payingOrderId, metodo_pago: metodo });
-      this.toast(`Pago de orden #${this.payingOrderId} registrado con éxito vía ${metodo.toUpperCase()}.`, 'success');
+      const data = await ApiCliente.post('/api/caja/pagos', { orden_id: this.payingOrderId, metodo_pago: metodo });
+      this.toast(`Pago registrado vía ${metodo.toUpperCase()}. Factura ${data.factura.numero_factura}.`, 'success');
       this.closeModal('modalPagarOrden');
       this.payingOrderId = null;
       this.loadOrders();
@@ -633,13 +637,24 @@ const app = {
   },
 
   onCitaClienteChange() {
-    const cid = document.getElementById('citaClienteSelect').value;
+    const cid = parseInt(document.getElementById('citaClienteSelect').value, 10);
     const anonFields = document.getElementById('citaCamposAnonimos');
+    const vehFields = document.getElementById('citaCampoVehiculo');
     anonFields.classList.toggle('hidden', !!cid);
+    vehFields.classList.toggle('hidden', !cid);
+
+    const vSelect = document.getElementById('citaVehiculoSelect');
+    vSelect.innerHTML = '<option value="">-- Seleccione el vehículo --</option>';
+    if (!cid) return;
+    const c = (this.clients || []).find(item => item.id === cid);
+    if (c && c.vehiculos) {
+      vSelect.innerHTML = c.vehiculos.map(v => `<option value="${v.id}">${v.placa} - ${v.marca} (${v.color})</option>`).join('');
+    }
   },
 
   async guardarNuevaCita() {
     const cliente_id = document.getElementById('citaClienteSelect').value || null;
+    const vehiculo_id = cliente_id ? (document.getElementById('citaVehiculoSelect').value || null) : null;
     const cliente_nombre = document.getElementById('citaAnonNombre').value;
     const placa = document.getElementById('citaAnonPlaca').value;
     const servicio_id = document.getElementById('citaServicioSelect').value;
@@ -649,7 +664,7 @@ const app = {
     if (!servicio_id || !fecha || !hora) { this.toast('Complete el servicio, la fecha y la hora.', 'warning'); return; }
 
     try {
-      await ApiCliente.post('/api/citas', { cliente_id, cliente_nombre, placa, servicio_id, fecha, hora });
+      await ApiCliente.post('/api/citas', { cliente_id, vehiculo_id, cliente_nombre, placa, servicio_id, fecha, hora });
       this.toast('Cita agendada correctamente.', 'success');
       this.closeModal('modalNuevaCita');
       this.loadCitas();
@@ -860,6 +875,7 @@ const app = {
       ]);
 
       this.insumos = insumos;
+      this.proveedores = proveedores;
       document.getElementById('stockAlertCount').textContent = alertas.length;
 
       const banner = document.getElementById('bannerStockCritico');
@@ -875,33 +891,56 @@ const app = {
       if (grid) {
         grid.innerHTML = insumos.map(i => {
           const ratio = Math.min(100, (i.stock_actual / (i.stock_minimo * 2 || 1)) * 100);
-          const isLow = i.stock_actual <= i.stock_minimo;
+          const isLow = i.bajo_stock;
+          const isInactivo = i.estado === 'inactivo';
           return `
-            <div class="insumo-card ${isLow ? 'critical' : ''}">
+            <div class="insumo-card ${isLow ? 'critical' : ''}" style="${isInactivo ? 'opacity: 0.6' : ''}">
               <div class="insumo-header">
                 <span class="insumo-name">${i.nombre}</span>
-                <span class="role-badge" style="background: ${isLow ? '#ef4444' : '#10b981'}">${isLow ? 'BAJO STOCK' : 'EN ORDEN'}</span>
+                <span class="role-badge" style="background: ${isInactivo ? '#64748b' : (isLow ? '#ef4444' : '#10b981')}">${isInactivo ? 'INACTIVO' : (isLow ? 'BAJO STOCK' : 'EN ORDEN')}</span>
               </div>
               <div class="insumo-stock-val">${Number(i.stock_actual).toLocaleString()} <span class="insumo-unit">${i.unidad_medida}</span></div>
               <div class="text-sm text-muted">Stock Mínimo: ${i.stock_minimo} ${i.unidad_medida}</div>
               <div class="stock-meter"><div class="stock-meter-fill ${isLow ? 'low' : 'normal'}" style="width: ${ratio}%"></div></div>
               <div class="text-sm text-dim">Proveedor: ${i.proveedor_nombre || 'Sin proveedor'}</div>
               <div class="text-sm text-dim">Último costo: ${this.formatMoney(i.costo_unitario)} / ${i.unidad_medida}</div>
-              <button class="btn btn-sm btn-outline admin-only mt-2" style="width: 100%" onclick="app.abrirModalEditarInsumo(${i.id}, '${i.nombre.replace(/'/g, "\\'")}', '${i.unidad_medida}', ${i.stock_minimo}, ${i.proveedor_id || 'null'})">Editar</button>
+              <div class="d-flex gap-2 mt-2">
+                <button class="btn btn-sm btn-outline admin-only" style="flex: 1" onclick="app.abrirModalEditarInsumo(${i.id})">Editar</button>
+                <button class="btn btn-sm btn-outline admin-only" style="flex: 1" onclick="app.toggleEstadoInsumo(${i.id}, '${i.estado}', '${i.nombre.replace(/'/g, "\\'")}')">${isInactivo ? 'Activar' : 'Inactivar'}</button>
+              </div>
             </div>
           `;
         }).join('');
       }
 
+      const insumosActivos = insumos.filter(i => i.estado === 'activo');
       ['entradaInsumoSelect', 'entregaInsumoSelect'].forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.innerHTML = insumos.map(i => `<option value="${i.id}">${i.nombre} (Stock actual: ${i.stock_actual} ${i.unidad_medida})</option>`).join('');
+        if (el) el.innerHTML = insumosActivos.map(i => `<option value="${i.id}">${i.nombre} (Stock actual: ${i.stock_actual} ${i.unidad_medida})</option>`).join('');
       });
 
+      const proveedoresActivos = proveedores.filter(p => p.estado === 'activo');
       ['entradaProveedorSelect', 'editInsProveedorSelect'].forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.innerHTML = proveedores.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('');
+        if (el) el.innerHTML = proveedoresActivos.map(p => `<option value="${p.id}">${p.nombre}</option>`).join('');
       });
+
+      const tbProv = document.getElementById('proveedoresTableBody');
+      if (tbProv) {
+        tbProv.innerHTML = proveedores.map(p => `
+          <tr>
+            <td><strong>${p.nombre}</strong></td>
+            <td>${p.contacto || '-'}</td>
+            <td>${p.telefono || '-'}</td>
+            <td>${p.correo || '-'}</td>
+            <td><span class="role-badge" style="background: ${p.estado === 'activo' ? '#10b981' : '#64748b'}">${p.estado.toUpperCase()}</span></td>
+            <td class="admin-only">
+              <button class="btn btn-sm btn-outline" onclick="app.abrirModalEditarProveedor(${p.id})">Editar</button>
+              <button class="btn btn-sm btn-outline" onclick="app.toggleEstadoProveedor(${p.id}, '${p.estado}', '${p.nombre.replace(/'/g, "\\'")}')">${p.estado === 'activo' ? 'Inactivar' : 'Activar'}</button>
+            </td>
+          </tr>
+        `).join('');
+      }
 
       const tbMov = document.getElementById('movimientosTableBody');
       if (tbMov) {
@@ -981,8 +1020,8 @@ const app = {
     }
 
     try {
-      await ApiCliente.post('/api/inventario/entradas', { insumo_id, cantidad, costo_unitario, proveedor_id, observacion });
-      this.toast('Entrada registrada. Stock y costo actualizados inmediatamente.', 'success');
+      const data = await ApiCliente.post('/api/inventario/entradas', { insumo_id, cantidad, costo_unitario, proveedor_id, observacion });
+      this.toast(`Entrada registrada. Factura ${data.factura.numero_factura}.`, 'success');
       this.closeModal('modalEntradaInsumo');
       this.loadInsumos();
     } catch (err) {
@@ -1026,13 +1065,15 @@ const app = {
     }
   },
 
-  abrirModalEditarInsumo(id, nombre, unidadMedida, stockMinimo, proveedorId) {
+  abrirModalEditarInsumo(id) {
+    const i = (this.insumos || []).find(item => item.id === id);
+    if (!i) return;
     this.editingInsumoId = id;
-    document.getElementById('editInsNombre').value = nombre;
-    document.getElementById('editInsUnidad').value = unidadMedida;
-    document.getElementById('editInsStockMinimo').value = stockMinimo;
+    document.getElementById('editInsNombre').value = i.nombre;
+    document.getElementById('editInsUnidad').value = i.unidad_medida;
+    document.getElementById('editInsStockMinimo').value = i.stock_minimo;
     const provSelect = document.getElementById('editInsProveedorSelect');
-    if (provSelect) provSelect.value = proveedorId || '';
+    if (provSelect) provSelect.value = i.proveedor_id || '';
     this.openModal('modalEditarInsumo');
   },
 
@@ -1050,6 +1091,19 @@ const app = {
       this.loadInsumos();
     } catch (err) {
       this.toast(err.message || 'No se pudo actualizar el insumo.', 'error');
+    }
+  },
+
+  /** Los insumos nunca se eliminan: solo se activan o inactivan. */
+  async toggleEstadoInsumo(id, estadoActual, nombre) {
+    const nuevoEstado = estadoActual === 'activo' ? 'inactivo' : 'activo';
+    if (!confirm(`¿${nuevoEstado === 'activo' ? 'Activar' : 'Inactivar'} el insumo "${nombre}"?`)) return;
+    try {
+      await ApiCliente.put(`/api/inventario/insumos/${id}`, { estado: nuevoEstado });
+      this.toast(`Insumo ${nuevoEstado === 'activo' ? 'activado' : 'inactivado'}.`, 'success');
+      this.loadInsumos();
+    } catch (err) {
+      this.toast(err.message || 'No se pudo cambiar el estado.', 'error');
     }
   },
 
@@ -1089,6 +1143,49 @@ const app = {
       this.proveedorReturnTo = null;
     } catch (err) {
       this.toast(err.message || 'No se pudo crear el proveedor.', 'error');
+    }
+  },
+
+  abrirModalEditarProveedor(id) {
+    const p = (this.proveedores || []).find(item => item.id === id);
+    if (!p) return;
+    this.editingProveedorId = id;
+    document.getElementById('editProvNombre').value = p.nombre;
+    document.getElementById('editProvContacto').value = p.contacto || '';
+    document.getElementById('editProvTelefono').value = p.telefono || '';
+    document.getElementById('editProvCorreo').value = p.correo || '';
+    document.getElementById('editProvDireccion').value = p.direccion || '';
+    this.openModal('modalEditarProveedor');
+  },
+
+  async guardarEdicionProveedor() {
+    const nombre = document.getElementById('editProvNombre').value.trim();
+    const contacto = document.getElementById('editProvContacto').value.trim();
+    const telefono = document.getElementById('editProvTelefono').value.trim();
+    const correo = document.getElementById('editProvCorreo').value.trim();
+    const direccion = document.getElementById('editProvDireccion').value.trim();
+    if (!nombre) { this.toast('El nombre es obligatorio.', 'warning'); return; }
+
+    try {
+      await ApiCliente.put(`/api/inventario/proveedores/${this.editingProveedorId}`, { nombre, contacto, telefono, correo, direccion });
+      this.toast('Proveedor actualizado.', 'success');
+      this.closeModal('modalEditarProveedor');
+      this.loadInsumos();
+    } catch (err) {
+      this.toast(err.message || 'No se pudo actualizar el proveedor.', 'error');
+    }
+  },
+
+  /** Los proveedores nunca se eliminan: solo se activan o inactivan. */
+  async toggleEstadoProveedor(id, estadoActual, nombre) {
+    const nuevoEstado = estadoActual === 'activo' ? 'inactivo' : 'activo';
+    if (!confirm(`¿${nuevoEstado === 'activo' ? 'Activar' : 'Inactivar'} al proveedor "${nombre}"?`)) return;
+    try {
+      await ApiCliente.put(`/api/inventario/proveedores/${id}`, { estado: nuevoEstado });
+      this.toast(`Proveedor ${nuevoEstado === 'activo' ? 'activado' : 'inactivado'}.`, 'success');
+      this.loadInsumos();
+    } catch (err) {
+      this.toast(err.message || 'No se pudo cambiar el estado.', 'error');
     }
   },
 
@@ -1534,13 +1631,216 @@ const app = {
   },
 
   // ===========================================================================
+  // 7B. FACTURAS (numeración automática CCPP-DDMMAA-NNN, ver backend)
+  // ===========================================================================
+  async loadFacturas() {
+    try {
+      const tipo = document.getElementById('facturasFiltroTipo').value;
+      const query = tipo ? `?tipo=${tipo}` : '';
+      const facturas = await ApiCliente.get(`/api/facturas${query}`);
+
+      const tb = document.getElementById('facturasTableBody');
+      if (tb) {
+        tb.innerHTML = facturas.map(f => `
+          <tr>
+            <td><strong>${f.numero_factura}</strong></td>
+            <td><span class="role-badge" style="background: ${f.tipo === 'venta' ? '#10b981' : '#f59e0b'}">${f.tipo.toUpperCase()}</span></td>
+            <td>${f.fecha}</td>
+            <td>${f.concepto}</td>
+            <td>${f.cliente_nombre || f.proveedor_nombre || '-'}</td>
+            <td>${this.formatMoney(f.total)}</td>
+            <td><button class="btn btn-sm btn-outline" onclick="app.verFacturaPdf(${f.id})">Ver PDF</button></td>
+          </tr>
+        `).join('');
+        if (facturas.length === 0) {
+          tb.innerHTML = `<tr><td colspan="7" class="text-center text-muted text-sm py-3">Aún no hay facturas registradas.</td></tr>`;
+        }
+      }
+    } catch (err) { console.error(err); }
+  },
+
+  async verFacturaPdf(id) {
+    try {
+      const respuesta = await fetch(`/api/facturas/${id}/pdf`, { headers: { Authorization: `Bearer ${ApiCliente.obtenerToken()}` } });
+      if (!respuesta.ok) throw new Error('No se pudo generar la factura.');
+      const blob = await respuesta.blob();
+      const enlace = document.createElement('a');
+      enlace.href = URL.createObjectURL(blob);
+      enlace.target = '_blank';
+      document.body.appendChild(enlace);
+      enlace.click();
+      enlace.remove();
+    } catch (err) {
+      this.toast(err.message || 'No se pudo abrir la factura.', 'error');
+    }
+  },
+
+  // ===========================================================================
   // 8. REPORTES: GANANCIAS Y DESCARGA EN PDF (CU18, CU19, CU29)
   // ===========================================================================
   setDashboardPeriod(period) {
     this.dashboardPeriod = period;
-    document.querySelectorAll('.period-btn').forEach(btn => btn.classList.toggle('active', btn.getAttribute('data-period') === period));
+    document.querySelectorAll('#tab-dashboard .period-selector:not(#reporteTipoSelector) .period-btn')
+      .forEach(btn => btn.classList.toggle('active', btn.getAttribute('data-period') === period));
     document.getElementById('reportePersonalizadoBox').classList.toggle('hidden', period !== 'personalizado');
-    this.loadDashboard();
+    this.loadReporteActivo();
+  },
+
+  /** Cambia cuál de los 7 reportes se está viendo en pantalla. */
+  setReporteTipo(tipo) {
+    this.reporteTipoActivo = tipo;
+    document.querySelectorAll('#reporteTipoSelector .period-btn').forEach(btn => btn.classList.toggle('active', btn.getAttribute('data-reporte') === tipo));
+    document.querySelectorAll('.reporte-subview').forEach(v => v.classList.toggle('hidden', v.id !== `reporte-${tipo}`));
+
+    // El reporte de Inventario es una foto del momento: no aplica período.
+    const esInventario = tipo === 'inventario';
+    document.querySelector('#tab-dashboard .period-selector:not(#reporteTipoSelector)').classList.toggle('hidden', esInventario);
+    document.getElementById('reportePersonalizadoBox').classList.toggle('hidden', esInventario || this.dashboardPeriod !== 'personalizado');
+
+    this.loadReporteActivo();
+  },
+
+  loadReporteActivo() {
+    const tipo = this.reporteTipoActivo || 'resumen';
+    if (tipo === 'personalizado' && this.dashboardPeriod === 'personalizado') return; // guard, no-op
+    const cargadores = {
+      resumen: () => this.loadDashboard(),
+      ventas: () => this.loadReporteVentas(),
+      compras: () => this.loadReporteCompras(),
+      inventario: () => this.loadReporteInventario(),
+      nomina: () => this.loadReporteNomina(),
+      comparativo: () => this.loadReporteComparativo(),
+      operativo: () => this.loadReporteOperativo()
+    };
+    (cargadores[tipo] || cargadores.resumen)();
+  },
+
+  /** Barras horizontales simples (sin librerías externas). data = [{label, value}] */
+  renderBarChart(elId, data, { color = '#0077b6', money = true } = {}) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    if (!data || data.length === 0) {
+      el.innerHTML = '<p class="text-muted text-sm text-center py-3">Sin datos en el período.</p>';
+      return;
+    }
+    const max = Math.max(...data.map(d => d.value), 1);
+    el.innerHTML = `<div class="bar-chart-list">${data.map(d => `
+      <div class="bar-chart-row">
+        <span class="bar-chart-label" title="${d.label}">${d.label}</span>
+        <div class="bar-chart-track"><div class="bar-chart-fill" style="width:${Math.max(2, (d.value / max) * 100).toFixed(1)}%; background:${color}"></div></div>
+        <span class="bar-chart-value">${money ? this.formatMoney(d.value) : d.value}</span>
+      </div>
+    `).join('')}</div>`;
+  },
+
+  /** Dona SVG simple. data = [{label, value, color}] */
+  renderDonutChart(elId, data) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    const total = data.reduce((s, d) => s + d.value, 0);
+    if (!total) {
+      el.innerHTML = '<p class="text-muted text-sm text-center py-3">Sin datos en el período.</p>';
+      return;
+    }
+    const radio = 45, circunferencia = 2 * Math.PI * radio;
+    let acumulado = 0;
+    const circulos = data.filter(d => d.value > 0).map(d => {
+      const frac = d.value / total;
+      const largo = frac * circunferencia;
+      const circle = `<circle r="${radio}" cx="60" cy="60" fill="transparent" stroke="${d.color}" stroke-width="18" stroke-dasharray="${largo} ${circunferencia - largo}" stroke-dashoffset="${-acumulado}" transform="rotate(-90 60 60)"></circle>`;
+      acumulado += largo;
+      return circle;
+    }).join('');
+    const leyenda = data.map(d => `<div class="donut-legend-item"><span class="donut-dot" style="background:${d.color}"></span>${d.label}: ${d.value} (${Math.round((d.value / total) * 100)}%)</div>`).join('');
+    el.innerHTML = `<div class="donut-chart-wrapper"><svg width="120" height="120" viewBox="0 0 120 120">${circulos}</svg><div class="donut-legend">${leyenda}</div></div>`;
+  },
+
+  async loadReporteVentas() {
+    try {
+      const r = await ApiCliente.get(`/api/reportes/ventas?${this.construirQueryPeriodo()}`);
+      document.getElementById('ventasTotal').textContent = this.formatMoney(r.totalVentas);
+      document.getElementById('ventasCantidad').textContent = r.cantidadVentas;
+      document.getElementById('ventasTicketProm').textContent = this.formatMoney(r.ticketPromedio);
+
+      this.renderBarChart('ventasPorServicioChart', Object.entries(r.porServicio).map(([label, value]) => ({ label, value })), { color: '#0077b6' });
+      this.renderDonutChart('ventasPorMetodoChart', Object.entries(r.porMetodoPago).map(([label, value], i) => ({ label: label.toUpperCase(), value, color: ['#0077b6', '#00b4d8', '#10b981', '#f59e0b'][i % 4] })));
+      this.renderDonutChart('ventasPorVehiculoChart', [
+        { label: 'Carros', value: r.porVehiculo.carro, color: '#0077b6' },
+        { label: 'Motos', value: r.porVehiculo.moto, color: '#00b4d8' }
+      ]);
+
+      document.getElementById('ventasTopClientesBody').innerHTML = r.topClientes.map(c => `
+        <tr><td>${c.nombre}</td><td>${c.cantidad}</td><td><strong>${this.formatMoney(c.total)}</strong></td></tr>
+      `).join('') || `<tr><td colspan="3" class="text-center text-muted text-sm py-3">Sin clientes registrados con compras en el período.</td></tr>`;
+    } catch (err) { console.error(err); }
+  },
+
+  async loadReporteCompras() {
+    try {
+      const r = await ApiCliente.get(`/api/reportes/compras?${this.construirQueryPeriodo()}`);
+      document.getElementById('comprasTotal').textContent = this.formatMoney(r.totalCompras);
+      document.getElementById('comprasCantidad').textContent = r.cantidadCompras;
+      this.renderBarChart('comprasPorProveedorChart', Object.entries(r.porProveedor).map(([label, value]) => ({ label, value })), { color: '#f59e0b' });
+      this.renderBarChart('comprasPorInsumoChart', Object.entries(r.porInsumo).map(([label, value]) => ({ label, value })), { color: '#f59e0b' });
+    } catch (err) { console.error(err); }
+  },
+
+  async loadReporteInventario() {
+    try {
+      const r = await ApiCliente.get('/api/reportes/inventario');
+      document.getElementById('inventarioValorTotal').textContent = this.formatMoney(r.valorTotalInventario);
+      document.getElementById('inventarioAlertas').textContent = r.alertas.length;
+      this.renderBarChart('inventarioValorChart', r.insumos.map(i => ({ label: i.nombre, value: i.valor })), { color: '#0077b6' });
+    } catch (err) { console.error(err); }
+  },
+
+  async loadReporteNomina() {
+    try {
+      const r = await ApiCliente.get(`/api/reportes/nomina?${this.construirQueryPeriodo()}`);
+      document.getElementById('nominaSalarios').textContent = this.formatMoney(r.salariosPagados);
+      document.getElementById('nominaComisiones').textContent = this.formatMoney(r.comisionesPagadas);
+      document.getElementById('nominaPendiente').textContent = this.formatMoney(r.liquidacionesPendientesTotal);
+      document.getElementById('nominaHoras').textContent = `${r.horasTrabajadasTotal} hrs`;
+      this.renderDonutChart('nominaAsistenciaChart', [
+        { label: 'Presentes', value: r.asistenciasPresentes, color: '#10b981' },
+        { label: 'Inasistencias', value: r.inasistencias, color: '#ef4444' }
+      ]);
+    } catch (err) { console.error(err); }
+  },
+
+  async loadReporteComparativo() {
+    try {
+      const r = await ApiCliente.get(`/api/reportes/comparativo?${this.construirQueryPeriodo()}`);
+      const fmtVar = v => v === null ? 'Sin datos del período anterior' : `${v > 0 ? '▲' : v < 0 ? '▼' : '='} ${Math.abs(v)}% vs. período anterior`;
+
+      this.renderBarChart('compIngresosChart', [
+        { label: 'Actual', value: r.actual.totalIngresos },
+        { label: 'Anterior', value: r.anterior.totalIngresos }
+      ], { color: '#0077b6' });
+      document.getElementById('compIngresosVar').textContent = fmtVar(r.variacionIngresos);
+
+      this.renderBarChart('compGananciaChart', [
+        { label: 'Actual', value: r.actual.gananciaNeta },
+        { label: 'Anterior', value: r.anterior.gananciaNeta }
+      ], { color: '#10b981' });
+      document.getElementById('compGananciaVar').textContent = fmtVar(r.variacionGanancia);
+
+      this.renderBarChart('compServiciosChart', [
+        { label: 'Actual', value: r.actual.serviciosAtendidos },
+        { label: 'Anterior', value: r.anterior.serviciosAtendidos }
+      ], { color: '#f59e0b', money: false });
+      document.getElementById('compServiciosVar').textContent = fmtVar(r.variacionServicios);
+    } catch (err) { console.error(err); }
+  },
+
+  async loadReporteOperativo() {
+    try {
+      const r = await ApiCliente.get(`/api/reportes/operativo?${this.construirQueryPeriodo()}`);
+      document.getElementById('opClientesNuevos').textContent = r.clientesNuevos;
+      document.getElementById('opClientesRecurrentes').textContent = r.clientesRecurrentes;
+      const coloresEstado = { agendada: '#0077b6', reprogramada: '#f59e0b', atendida: '#10b981', cancelada: '#ef4444' };
+      this.renderDonutChart('opCitasChart', Object.entries(r.porEstadoCitas).map(([label, value]) => ({ label: label[0].toUpperCase() + label.slice(1), value, color: coloresEstado[label] || '#64748b' })));
+    } catch (err) { console.error(err); }
   },
 
   construirQueryPeriodo() {
@@ -1611,14 +1911,17 @@ const app = {
    * token JWT en el header Authorization, así que se pide como blob.
    */
   async descargarReportePdf() {
-    const url = `/api/reportes/dashboard/pdf?${this.construirQueryPeriodo()}`;
+    const tipo = this.reporteTipoActivo || 'resumen';
+    const endpoint = tipo === 'resumen' ? 'dashboard' : tipo;
+    const query = tipo === 'inventario' ? '' : `?${this.construirQueryPeriodo()}`;
+    const url = `/api/reportes/${endpoint}/pdf${query}`;
     try {
       const respuesta = await fetch(url, { headers: { Authorization: `Bearer ${ApiCliente.obtenerToken()}` } });
       if (!respuesta.ok) throw new Error('No se pudo generar el PDF.');
       const blob = await respuesta.blob();
       const enlace = document.createElement('a');
       enlace.href = URL.createObjectURL(blob);
-      enlace.download = 'reporte_carwash.pdf';
+      enlace.download = `reporte_${tipo}.pdf`;
       document.body.appendChild(enlace);
       enlace.click();
       enlace.remove();
